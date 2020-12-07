@@ -36,6 +36,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from scipy.signal import get_window
 from librosa.util import pad_center, tiny
+from librosa import stft, istft
 from audio_processing import window_sumsquare
 
 
@@ -80,27 +81,40 @@ class STFT(torch.nn.Module):
 
         self.num_samples = num_samples
 
-        # similar to librosa, reflect-pad the input
-        input_data = input_data.view(num_batches, 1, num_samples)
-        input_data = F.pad(
-            input_data.unsqueeze(1),
-            (int(self.filter_length / 2), int(self.filter_length / 2), 0, 0),
-            mode='reflect')
-        input_data = input_data.squeeze(1)
+        if input_data.device.type == "cuda":
+            # similar to librosa, reflect-pad the input
+            input_data = input_data.view(num_batches, 1, num_samples)
+            input_data = F.pad(
+                input_data.unsqueeze(1),
+                (int(self.filter_length / 2), int(self.filter_length / 2), 0, 0),
+                mode='reflect')
+            input_data = input_data.squeeze(1)
+            
+            forward_transform = F.conv1d(
+                input_data,
+                self.forward_basis,
+                stride=self.hop_length,
+                padding=0)
 
-        forward_transform = F.conv1d(
-            input_data,
-            Variable(self.forward_basis, requires_grad=False),
-            stride=self.hop_length,
-            padding=0)
-
-        cutoff = int((self.filter_length / 2) + 1)
-        real_part = forward_transform[:, :cutoff, :]
-        imag_part = forward_transform[:, cutoff:, :]
+            cutoff = int((self.filter_length / 2) + 1)
+            real_part = forward_transform[:, :cutoff, :]
+            imag_part = forward_transform[:, cutoff:, :]
+        else:
+            x = input_data.detach().numpy()
+            real_part = []
+            imag_part = []
+            for y in x:
+                y_ = stft(y, self.filter_length, self.hop_length, self.win_length, self.window)
+                real_part.append(y_.real[None,:,:])
+                imag_part.append(y_.imag[None,:,:])
+            real_part = np.concatenate(real_part, 0)
+            imag_part = np.concatenate(imag_part, 0)
+            
+            real_part = torch.from_numpy(real_part).to(input_data.dtype)
+            imag_part = torch.from_numpy(imag_part).to(input_data.dtype)
 
         magnitude = torch.sqrt(real_part**2 + imag_part**2)
-        phase = torch.autograd.Variable(
-            torch.atan2(imag_part.data, real_part.data))
+        phase = torch.atan2(imag_part.data, real_part.data)
 
         return magnitude, phase
 
@@ -108,30 +122,42 @@ class STFT(torch.nn.Module):
         recombine_magnitude_phase = torch.cat(
             [magnitude*torch.cos(phase), magnitude*torch.sin(phase)], dim=1)
 
-        inverse_transform = F.conv_transpose1d(
-            recombine_magnitude_phase,
-            Variable(self.inverse_basis, requires_grad=False),
-            stride=self.hop_length,
-            padding=0)
+        if magnitude.device.type == "cuda":
+            inverse_transform = F.conv_transpose1d(
+                recombine_magnitude_phase,
+                self.inverse_basis,
+                stride=self.hop_length,
+                padding=0)
 
-        if self.window is not None:
-            window_sum = window_sumsquare(
-                self.window, magnitude.size(-1), hop_length=self.hop_length,
-                win_length=self.win_length, n_fft=self.filter_length,
-                dtype=np.float32)
-            # remove modulation effects
-            approx_nonzero_indices = torch.from_numpy(
-                np.where(window_sum > tiny(window_sum))[0])
-            window_sum = torch.autograd.Variable(
-                torch.from_numpy(window_sum), requires_grad=False)
-            window_sum = window_sum.cuda() if magnitude.is_cuda else window_sum
-            inverse_transform[:, :, approx_nonzero_indices] /= window_sum[approx_nonzero_indices]
+            if self.window is not None:
+                window_sum = window_sumsquare(
+                    self.window, magnitude.size(-1), hop_length=self.hop_length,
+                    win_length=self.win_length, n_fft=self.filter_length,
+                    dtype=np.float32)
+                # remove modulation effects
+                approx_nonzero_indices = torch.from_numpy(
+                    np.where(window_sum > tiny(window_sum))[0])
+                window_sum = torch.from_numpy(window_sum).to(inverse_transform.device)
+                inverse_transform[:, :, approx_nonzero_indices] /= window_sum[approx_nonzero_indices]
 
-            # scale by hop ratio
-            inverse_transform *= float(self.filter_length) / self.hop_length
+                # scale by hop ratio
+                inverse_transform *= float(self.filter_length) / self.hop_length
 
-        inverse_transform = inverse_transform[:, :, int(self.filter_length/2):]
-        inverse_transform = inverse_transform[:, :, :-int(self.filter_length/2):]
+            inverse_transform = inverse_transform[:, :, int(self.filter_length/2):]
+            inverse_transform = inverse_transform[:, :, :-int(self.filter_length/2):]
+            inverse_transform = inverse_transform.squeeze(1)
+        else:
+            x_org = recombine_magnitude_phase.detach().numpy()
+            n_b, n_f, n_t = x_org.shape
+            x = np.empty([n_b, n_f//2, n_t], dtype=np.complex64)
+            x.real = x_org[:,:n_f//2]
+            x.imag = x_org[:,n_f//2:]
+            inverse_transform = []
+            for y in x:
+                y_ = istft(y, self.hop_length, self.win_length, self.window)
+                inverse_transform.append(y_[None,:])
+            inverse_transform = np.concatenate(inverse_transform, 0)
+            inverse_transform = torch.from_numpy(inverse_transform).to(recombine_magnitude_phase.dtype)
 
         return inverse_transform
 
