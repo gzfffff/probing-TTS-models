@@ -77,6 +77,9 @@ if __name__ == '__main__':
 
     args = parser.parse_args()    
     
+    bert_path = os.path.join(args.path, 'bert')
+    os.mkdir(bert_path)
+    
     model, tokenizer= load_model(args.path)
     
     text_file = os.path.join(args.path,"ProsodyLabeling/000001-010000.txt") 
